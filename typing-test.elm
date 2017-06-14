@@ -1,10 +1,10 @@
 -- Read all about this program in the official Elm guide:
 -- https://guide.elm-lang.org/architecture/user_input/text_fields.html
 
-import Html exposing (Html, Attribute, program, text, div, textarea)
+import Html exposing (Html, Attribute, program, text, div, textarea, span)
 import Platform.Cmd as Cmd
 import Platform.Cmd exposing (Cmd)
-import Html.Attributes exposing (attribute, style)
+import Html.Attributes exposing (attribute, style, placeholder, disabled, rows, cols)
 import Html.Events exposing (onInput)
 import Array exposing (Array)
 import Maybe exposing (withDefault)
@@ -12,6 +12,8 @@ import Http
 import Regex exposing (regex)
 import Time exposing (Time, second, minute)
 import Task
+
+import EditDistance
 
 challenge_url = "input.txt"
 -- time_limit = 5 * minute
@@ -43,11 +45,20 @@ tickState state t =
     _ -> state
 
 type alias Model =
-  { input : String
+  { input : Array String
   , challenges : Array (Array String)
+  , challengeId : Int
   , now : Time
+  , score : Maybe Int
+  , inputErrors : Array Bool
+  , challengeErrors : Array Bool
+  , errorMatrix : Array (Array (Int, EditDistance.ErrorOp))
   , state : State
   }
+
+challenge : Model -> Array String
+challenge model =
+  Array.get model.challengeId model.challenges |> withDefault Array.empty
 
 
 -- UPDATE
@@ -67,18 +78,36 @@ update msg model =
     Challenges (Err _) ->
       (model, Cmd.none)
     Input input ->
-      ( { model | input = input }
-      , case model.state of
-          Init -> Time.now |> Task.perform StartTime
-          _ -> Cmd.none
-      )
+      let input_ = parseParagraph input
+          errors = challenge model
+                 |> EditDistance.score input_
+      in ( { model | input = parseParagraph input
+                   , score = Just errors.score
+                   , inputErrors = errors.leftErrors
+                   , challengeErrors = errors.rightErrors
+                   , errorMatrix = errors.matrix
+           }
+         , case model.state of
+               -- Init -> Time.now |> Task.perform StartTime
+               _    -> Cmd.none )
     StartTime t ->
       ( { model | now = t
                 , state = Running t }
       , Cmd.none )
     Tick t ->
-      ( { model | now = t
-                , state = tickState model.state t }
+      ( case model.state of
+          Running began ->
+            let model_ = { model | now = t }
+            in if t - began >= time_limit
+               then let errors = EditDistance.score model.input (challenge model)
+                    in { model_ | state = Finished
+                                , score = Just errors.score
+                                , inputErrors = errors.leftErrors
+                                , challengeErrors = errors.rightErrors
+                                , errorMatrix = errors.matrix
+                                }
+               else model_
+          _ -> model
       , Cmd.none )
 
 parseParagraph : String -> Array String
@@ -127,61 +156,6 @@ parseParagraphs raw =
         |> List.map parseParagraph
         |> Array.fromList
 
-score : Array String -> Array String -> (Int, (Array Bool, Array Bool))
-score x y =
-  let nx = Array.length x
-      ny = Array.length y
-      -- maxMaybe : Maybe Int -> Maybe Int -> Maybe Int
-      maxMaybe a b =
-        case (a,b) of
-          (a, Nothing) -> a
-          (Nothing, b) -> b
-          (Just av, Just bv) -> max av bv
-      -- grow : Int -> Int -> Array Int -> List Int -> Int
-      grow i j rows rowCurr =
-        case (Array.get i x, Array.get j y) of
-          (Nothing, _) ->
-            Array.fromList (List.reverse rows)
-          (_, Nothing) ->
-            grow (i+1) 0 (rowCurr |> List.reverse |> Array.fromList) []
-          (Just xi, Just yj) ->
-            let stepi = List.head rows
-                      |> Maybe.andThen (Array.get i)
-                      |> Maybe.map (\(k,_,_) -> (k+1, 1, 0))
-                stepj = List.head rowCurr
-                      |> Maybe.map (\(k,_,_) -> (k+1, 0, 1))
-                mismatch = if xi == yj then 0 else 1
-                stepij = List.head rows
-                       |> Maybe.andThen (Array.get (i-1) rowPrev)
-                       |> Maybe.map (\(k,_,_) -> (k+mismatch, 1, 1))
-                next = stepi |> maxMaybe stepj |> maxMaybe stepij |> withDefault 0
-            in grow i (j+1) rowPrev (next :: rowCurr)
-      table = grow 0 0 [] []
-      getErrors i j xErrors yErrors =
-        table |> Array.get i
-              |> Maybe.andThen (Array.get j)
-              |> Maybe.map (\(_,di,dj) ->
-                  let isMatch = Maybe.map2 (\xi yj -> xi == yj)
-                                 (Array.get i xi) (Array.get j xj)
-                                 |> withDefault False
-                                 |> and (di == 1)
-                                 |> and (dj == 1)
-                      xErrors_ = if di == 1
-                                 then isMatch :: xErrors
-                                 else xErrors
-                      yErrors_ = if dj == 1
-                                 then isMatch :: yErrors
-                                 else yErrors
-                  in getErrors (i-di) (j-dj) xErrors_ yErrors_)
-              |> withDefault (xErrors, yErrors)
-      score = table
-            |> Array.get (nx-1)
-            |> Maybe.andThen (Array.get (ny-1))
-            |> Maybe.map (\(k,_,_) -> k)
-      errors = getErrors (nx-1) (ny-1) [] []
-               |>
-    in (score, Array.fromList xErrors, Array.fromList yErrors)
-
 
 -- VIEW
 
@@ -190,8 +164,8 @@ view model =
   let
     finished =
       case model.state of
-        Finished -> False
-        _ -> True
+        Finished -> True
+        _ -> False
     timeRemaining =
       case model.state of
         Init -> time_limit
@@ -212,36 +186,64 @@ view model =
       [ placeholder "Type here"
       , onInput Input
       , textStyle
+      , style [ ("display", if finished then "none" else "inline-block")]
       , attribute "spellcheck" "false"
-      , disabled (not finished)
+      , disabled finished
       , rows 20
       , cols 83] []
-    paragraph =
-      textarea
+    input_score =
+      div
       [ textStyle
-      , attribute "spellcheck" "false"
-      , disabled True
-      , rows 20
-      , cols 83] [ text (challenge model)]
+      , style
+        [ ("height", "24em")
+        , ("display", if finished then "inline-block" else "none")] ]
+      [ format_tokens model.input model.inputErrors ]
+    paragraph =
+      div
+      [ textStyle
+      , style [("height", "24em")] ]
+      [ Array.get model.challengeId model.challenges
+        |> withDefault Array.empty
+      |> (\tokens -> format_tokens tokens model.challengeErrors) ]
+    -- paragraph =
+    --   textarea
+    --   [ textStyle
+    --   , attribute "spellcheck" "false"
+    --   , disabled True
+    --   , rows 20
+    --   , cols 83] [ text (challenge model)]
     -- paragraph =
     --   div [ textStyle, style [ ("height", "20em")] ] [ text (challenge model) ]
   in
     div []
       [ clock
       , input
+      , input_score
       , paragraph
       ]
 
-challenge : Model -> String
-challenge model =
-     Array.get 1 model.challenges  |> withDefault Array.empty |> Array.toList |> String.join ""
+format_token : String -> Bool -> Html Msg
+format_token s err = span [style [("background", if err then "red" else "none")]] [text s]
+
+format_tokens : Array String -> Array Bool -> Html Msg
+format_tokens tokens errors =
+  let getFormattedToken i s = Array.get i errors
+                            |> withDefault True
+                            |> format_token s
+  in div [] (Array.indexedMap getFormattedToken tokens |> Array.toList)
+
+-- challenge : Model -> String
+-- challenge model =
+--      Array.get model.challengeId model.challenges  |> withDefault Array.empty |> Array.toList |> String.join ""
 
 
 -- SUBSCRIPTIONS
 
 subscriptions : Model -> Sub Msg
 subscriptions model =
-  Time.every second Tick
+  case model.state of
+    Running _ -> Time.every second Tick
+    _ -> Sub.none
   -- Sub.none
 
 
@@ -250,7 +252,16 @@ subscriptions model =
 init : (Model, Cmd Msg)
 init =
   let
-    model = { challenges = Array.empty, input = "", state = Init, now = 0 }
+    model = { challenges = Array.empty
+            , challengeId = 1
+            , input = Array.empty
+            , state = Init
+            , now = 0
+            , score = Nothing
+            , inputErrors = Array.empty
+            , challengeErrors = Array.empty
+            , errorMatrix = Array.empty
+            }
     cmd = Http.send Challenges (Http.getString challenge_url)
   in
     (model, cmd)
