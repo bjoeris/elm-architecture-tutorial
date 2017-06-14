@@ -13,7 +13,7 @@ import Regex exposing (regex)
 import Time exposing (Time, second, minute)
 import Task
 
-import EditDistance
+import EditDistance exposing (ErrorOp)
 
 challenge_url = "input.txt"
 -- time_limit = 5 * minute
@@ -81,7 +81,7 @@ update msg model =
       let input_ = parseParagraph input
           errors = challenge model
                  |> EditDistance.score input_
-      in ( { model | input = parseParagraph input
+      in ( { model | input = input_
                    , score = Just errors.score
                    , inputErrors = errors.leftErrors
                    , challengeErrors = errors.rightErrors
@@ -112,26 +112,27 @@ update msg model =
 
 parseParagraph : String -> Array String
 parseParagraph string =
-  let
-    -- token is either:
-    -- * one or more letters/numbers (e.g. "ab123c"),
-    -- * one or more whitespace characters
-    -- * exactly one other character (presumably punctuation)
-    raw_tokens =
-        string
-          |> Regex.find Regex.All (regex "([\\w]+)|([\\s]+)|([^\\w\\s])")
-          |> List.map (\match -> match.match)
-    correct_whitespace prev_token token =
-      if Regex.contains (regex "[\\s]") token
-      then
-          if prev_token == "."
-          then "  "
-          else " "
-      else
-          token
-  in
-    List.map2 correct_whitespace ("" :: raw_tokens) raw_tokens
-      |> Array.fromList
+  -- token is either:
+  -- * one or more letters/numbers (e.g. "ab123c"),
+  -- * one or more whitespace characters
+  -- * exactly one other character (presumably punctuation)
+  string |> Regex.find Regex.All (regex "([\\w]+)|([\\s]+)|([^\\w\\s])")
+         |> List.map (\match -> match.match)
+         |> Array.fromList
+
+normalizeSpaces : Array String -> Array String
+normalizeSpaces paragraph =
+  let fixSpace i token =
+        let prevToken = paragraph |> Array.get i |> withDefault ""
+        in if Regex.contains (regex "[\\s]") token
+            then
+                if prevToken == "."
+                then "  "
+                else " "
+            else
+                token
+  in Array.indexedMap fixSpace paragraph
+
 
 mergeLines : List String -> List String
 mergeLines lines =
@@ -148,13 +149,22 @@ mergeLines lines =
       |> List.filter (String.isEmpty >> not)
       |> List.reverse
 
+
 parseParagraphs : String -> Array (Array String)
 parseParagraphs raw =
     raw |> String.lines
         |> mergeLines
-        -- |> Regex.split Regex.All (regex "[\\r\\n][\\r\\n]+")
-        |> List.map parseParagraph
+        |> List.map (parseParagraph >> normalizeSpaces)
         |> Array.fromList
+
+
+countWords : Array String -> Int
+countWords tokens =
+  let tokenChars token = if String.beginsWith " " token
+                         then 0
+                         else String.length token
+      nonWS = tokens |> Array.map tokenChars |> Array.sum
+  in nonWS // 5
 
 
 -- VIEW
@@ -181,6 +191,14 @@ view model =
       [toString minutesRemaining, secondsString] |> String.join ":"
     clock =
       div [ clockStyle ] [ text timeString ]
+    words = countWords (challenge model)
+    wpm = time_limit // words
+    score k = div [ scoreStyle ]
+              [ text "Errors: "
+              , k |> toString |> text,
+              , text "WPM: "
+              , wpm |> toString |> text ]
+    maybeScore = model.score |> Maybe.map score |> withDefault (div [] [])
     input =
       textarea
       [ placeholder "Type here"
@@ -205,18 +223,9 @@ view model =
       [ Array.get model.challengeId model.challenges
         |> withDefault Array.empty
       |> (\tokens -> format_tokens tokens model.challengeErrors) ]
-    -- paragraph =
-    --   textarea
-    --   [ textStyle
-    --   , attribute "spellcheck" "false"
-    --   , disabled True
-    --   , rows 20
-    --   , cols 83] [ text (challenge model)]
-    -- paragraph =
-    --   div [ textStyle, style [ ("height", "20em")] ] [ text (challenge model) ]
   in
     div []
-      [ clock
+      [ span [] [ maybeScore, clock ]
       , input
       , input_score
       , paragraph
@@ -232,10 +241,6 @@ format_tokens tokens errors =
                             |> format_token s
   in div [] (Array.indexedMap getFormattedToken tokens |> Array.toList)
 
--- challenge : Model -> String
--- challenge model =
---      Array.get model.challengeId model.challenges  |> withDefault Array.empty |> Array.toList |> String.join ""
-
 
 -- SUBSCRIPTIONS
 
@@ -244,7 +249,6 @@ subscriptions model =
   case model.state of
     Running _ -> Time.every second Tick
     _ -> Sub.none
-  -- Sub.none
 
 
 -- INIT
@@ -273,18 +277,25 @@ textStyle =
     [ ("padding", "10px 10px")
     , ("font-family", monoFont)
     , ("white-space", "pre-wrap")
-    , ("width", "83ch")
+    , ("width", "84ch")
     , ("margin-left", "50%")
     , ("transform", "translate(-50%, 0)")
     , ("overflow", "hidden")
     , ("background-color", "#eff0f1")
     ]
 
-clockStyle = 
+clockStyle =
   style
     [ ("padding", "10px 0px")
     , ("font-family", monoFont)
     , ("margin-left", "50%")
     , ("transform", "translate(-50%, 0)")
     , ("text-align", "right")
+    ]
+
+scoreStyle =
+  style
+    [ ("padding", "10px 0px")
+    , ("font-family", monoFont)
+    , ("text-align", "center")
     ]
