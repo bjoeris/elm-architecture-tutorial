@@ -1,6 +1,3 @@
--- Read all about this program in the official Elm guide:
--- https://guide.elm-lang.org/architecture/user_input/text_fields.html
-
 import Html exposing (Html, Attribute, program, text, div, textarea, span)
 import Platform.Cmd as Cmd
 import Platform.Cmd exposing (Cmd)
@@ -12,13 +9,23 @@ import Http
 import Regex exposing (regex)
 import Time exposing (Time, second, minute)
 import Task
+import Random
 
-import EditDistance exposing (ErrorOp)
+import Debug
 
-challenge_url = "input.txt"
--- time_limit = 5 * minute
-time_limit = 5 * second
+import EditDistance exposing (ErrorOp, TokenErr(TokenIncorrect, TokenMissing))
 
+
+{-| The path which challenge paragraphs are loaded from. -}
+challengeUrl : String
+challengeUrl = "input.txt"
+
+
+timeLimit : Time
+timeLimit = 5 * minute
+
+
+{-| Entry point -}
 main : Program Never Model Msg
 main = program
   { init = init
@@ -30,32 +37,29 @@ main = program
 
 -- MODEL
 
+{-| Possible states of the application -}
 type State
-  = Init
-  | Running Time -- Running, with the time began
-  | Finished
+  = Init  -- ^ initial state, before typing begins
+  | Running  -- ^ currently typing, time is running
+  | Finished  -- ^ time has run out, or the user indicated they were finished
 
-tickState : State -> Time -> State
-tickState state t =
-  case state of
-    Running began ->
-      if t - began >= time_limit
-      then Finished
-      else state
-    _ -> state
-
+{-| All data of the running application -}
 type alias Model =
-  { input : Array String
-  , challenges : Array (Array String)
-  , challengeId : Int
-  , now : Time
-  , score : Maybe Int
-  , inputErrors : Array Bool
-  , challengeErrors : Array Bool
-  , errorMatrix : Array (Array (Int, EditDistance.ErrorOp))
-  , state : State
+  { input : Array String  -- ^ the typed input, parsed into tokens
+  , challenges : Array (Array String)  -- ^ the challenge paragraphs, each parsed into tokens
+  , challengeId : Int  -- ^ which of the challenge paragraphs to display
+  , startTime : Time  -- ^ time which typing began
+  , now : Time  -- ^ current time
+  , numErrors : Int  -- ^ number of typing errors
+  , numWords : Int  -- ^ 'word count' of correctly counted words (see EditDistance.countCorrectWords)
+  , inputErrors : Array TokenErr  -- ^ the error statuses (correct, incorrect, or missing) of the typed input tokens
+  , challengeErrors : Array TokenErr  -- ^ the error statuses of the challenge paragraph tokens
+  , scoreMatrix : Array (Array (Int, EditDistance.ErrorOp))  -- ^ the score matrix (see EditDistance.scoreMatrix)
+  , state : State  -- ^ state of the application (see State)
   }
 
+
+{-| Get the current challenge paragraph from the model -}
 challenge : Model -> Array String
 challenge model =
   Array.get model.challengeId model.challenges |> withDefault Array.empty
@@ -63,63 +67,96 @@ challenge model =
 
 -- UPDATE
 
+{-| Possible messages that can be received by the application -}
 type Msg
-  = Challenges(Result Http.Error String)
+  = Challenges (Result Http.Error String)
+  | ChallengeId Int
   | Input String
   | StartTime Time
   | Tick Time
+  | Discard Int  -- ^ Hack. there is a bug with the first number from the random number generator
 
+
+{-| Move the model to the Finished state -}
+finish : Model -> Model
+finish model =
+  let errors = EditDistance.score model.input (challenge model)
+  in { model | state = Finished
+             , numWords = errors.numWords
+             , numErrors = errors.numErrors
+             , inputErrors = errors.leftErrors
+             , challengeErrors = errors.rightErrors
+             , scoreMatrix = errors.matrix }
+
+
+{-| Update the model, given an input message. -}
 update : Msg -> Model -> (Model, Cmd Msg)
 update msg model =
   case msg of
     Challenges (Ok challenges) ->
-      ( { model | challenges = parseParagraphs challenges }
-      , Cmd.none )
+      let parsedChallenges = parseParagraphs challenges
+      in ( { model | challenges = parsedChallenges }
+         , Random.generate ChallengeId (Random.int 0 (Debug.log "length" (Array.length parsedChallenges - 1))) )
     Challenges (Err _) ->
       (model, Cmd.none)
+    ChallengeId challengeId ->
+      ( { model | challengeId = Debug.log "challengeId" challengeId }, Cmd.none )
     Input input ->
       let input_ = parseParagraph input
-          errors = challenge model
-                 |> EditDistance.score input_
-      in ( { model | input = input_
-                   , score = Just errors.score
-                   , inputErrors = errors.leftErrors
-                   , challengeErrors = errors.rightErrors
-                   , errorMatrix = errors.matrix
-           }
-         , case model.state of
-               -- Init -> Time.now |> Task.perform StartTime
+          model_ = { model | input = input_ }
+          finishIndicated = Array.get (Array.length input_ - 1) input_
+                            |> withDefault ""
+                            |> String.endsWith "\n\n"
+          newModel = if finishIndicated
+                     then finish model_
+                     else model_
+      in ( newModel
+         , case newModel.state of
+               Init -> Time.now |> Task.perform StartTime
                _    -> Cmd.none )
     StartTime t ->
       ( { model | now = t
-                , state = Running t }
+                , startTime = t
+                , state = Running }
       , Cmd.none )
     Tick t ->
       ( case model.state of
-          Running began ->
+          Running ->
             let model_ = { model | now = t }
-            in if t - began >= time_limit
+            in if t - model.startTime >= timeLimit
                then let errors = EditDistance.score model.input (challenge model)
                     in { model_ | state = Finished
-                                , score = Just errors.score
+                                , numWords = errors.numWords
+                                , numErrors = errors.numErrors
                                 , inputErrors = errors.leftErrors
                                 , challengeErrors = errors.rightErrors
-                                , errorMatrix = errors.matrix
+                                , scoreMatrix = errors.matrix
                                 }
                else model_
           _ -> model
       , Cmd.none )
+    Discard _ -> (model, Cmd.none)
 
+
+{-| Parse a paragraph into an array of tokens.
+
+A token is a maximal substring that is either
+
+* one or more whitespace characters
+* one or more alpha-numeric characters
+* exactly one non-whitespace, non-alpha-numeric character
+-}
 parseParagraph : String -> Array String
 parseParagraph string =
-  -- token is either:
-  -- * one or more letters/numbers (e.g. "ab123c"),
-  -- * one or more whitespace characters
-  -- * exactly one other character (presumably punctuation)
   string |> Regex.find Regex.All (regex "([\\w]+)|([\\s]+)|([^\\w\\s])")
          |> List.map (\match -> match.match)
          |> Array.fromList
 
+
+{-| Convert all whitespace tokens into a single whitespace character, except
+whitespace tokens following a full-stop which are converted to two whitespace
+characters.
+-}
 normalizeSpaces : Array String -> Array String
 normalizeSpaces paragraph =
   let fixSpace i token =
@@ -134,6 +171,7 @@ normalizeSpaces paragraph =
   in Array.indexedMap fixSpace paragraph
 
 
+{-| Merge lines into paragraphs. At least one empty line marks the break between paragraphs. -}
 mergeLines : List String -> List String
 mergeLines lines =
     List.foldl (\line res ->
@@ -150,6 +188,7 @@ mergeLines lines =
       |> List.reverse
 
 
+{-| parse the paragraphs from the input file -}
 parseParagraphs : String -> Array (Array String)
 parseParagraphs raw =
     raw |> String.lines
@@ -158,17 +197,9 @@ parseParagraphs raw =
         |> Array.fromList
 
 
-countWords : Array String -> Int
-countWords tokens =
-  let tokenChars token = if String.beginsWith " " token
-                         then 0
-                         else String.length token
-      nonWS = tokens |> Array.map tokenChars |> Array.sum
-  in nonWS // 5
-
-
 -- VIEW
 
+{-| Create the visual representation of the application -}
 view : Model -> Html Msg
 view model =
   let
@@ -178,8 +209,8 @@ view model =
         _ -> False
     timeRemaining =
       case model.state of
-        Init -> time_limit
-        Running began -> began + time_limit - model.now
+        Init -> timeLimit
+        Running -> model.startTime + timeLimit - model.now
         Finished -> 0
     minutesRemaining =
       timeRemaining |> Time.inMinutes |> truncate
@@ -191,14 +222,25 @@ view model =
       [toString minutesRemaining, secondsString] |> String.join ":"
     clock =
       div [ clockStyle ] [ text timeString ]
-    words = countWords (challenge model)
-    wpm = time_limit // words
-    score k = div [ scoreStyle ]
-              [ text "Errors: "
-              , k |> toString |> text,
-              , text "WPM: "
-              , wpm |> toString |> text ]
-    maybeScore = model.score |> Maybe.map score |> withDefault (div [] [])
+    numErrors k = span [style [("padding-right", "20pt")]]
+                  [ text "Errors: "
+                  , k |> toString |> text ]
+    wpm model = span []
+            [ text "WPM: "
+            , round (toFloat model.numWords / (model.startTime - model.now |> Time.inMinutes)) |> toString |> text ]
+    header =
+      case model.state of
+        Finished -> div [scoreStyle]
+                    [ span [style [("padding-right", "20pt")]]
+                          [ text "Errors: "
+                          , model.numErrors |> toString |> text ]
+                    , span []
+                        [ text "WPM: "
+                        , round (toFloat model.numWords /
+                                     (model.now - model.startTime |>
+                                          Time.inMinutes)) |>
+                            toString |> text ] ]
+        _ -> clock
     input =
       textarea
       [ placeholder "Type here"
@@ -209,73 +251,102 @@ view model =
       , disabled finished
       , rows 20
       , cols 83] []
-    input_score =
+    inputScore =
       div
       [ textStyle
       , style
         [ ("height", "24em")
         , ("display", if finished then "inline-block" else "none")] ]
-      [ format_tokens model.input model.inputErrors ]
+      [ formatTokens model.input model.inputErrors ]
     paragraph =
       div
       [ textStyle
       , style [("height", "24em")] ]
       [ Array.get model.challengeId model.challenges
         |> withDefault Array.empty
-      |> (\tokens -> format_tokens tokens model.challengeErrors) ]
+      |> (\tokens -> formatTokens tokens model.challengeErrors) ]
   in
     div []
-      [ span [] [ maybeScore, clock ]
+      [ header
       , input
-      , input_score
+      , inputScore
       , paragraph
       ]
 
-format_token : String -> Bool -> Html Msg
-format_token s err = span [style [("background", if err then "red" else "none")]] [text s]
 
-format_tokens : Array String -> Array Bool -> Html Msg
-format_tokens tokens errors =
+{-| Set the background color of a token, based on its error status
+* Correct: no background
+* Incorrect: red background
+* Missing: yellow background
+-}
+formatToken : String -> Maybe TokenErr -> Html Msg
+formatToken s err =
+  let background =
+        case err of
+          Just TokenIncorrect -> "red"
+          Just TokenMissing -> "yellow"
+          _ -> "none"
+  in span [style [("background", background)]] [text s]
+
+
+{-| Set the background color of a sequence of tokens -}
+formatTokens : Array String -> Array TokenErr -> Html Msg
+formatTokens tokens errors =
   let getFormattedToken i s = Array.get i errors
-                            |> withDefault True
-                            |> format_token s
+                            |> formatToken s
   in div [] (Array.indexedMap getFormattedToken tokens |> Array.toList)
 
 
 -- SUBSCRIPTIONS
 
+
+{-| The regular updates the application listens to -}
 subscriptions : Model -> Sub Msg
 subscriptions model =
   case model.state of
-    Running _ -> Time.every second Tick
+    Running -> Time.every second Tick
     _ -> Sub.none
 
 
 -- INIT
 
+{-| Initial application data -}
 init : (Model, Cmd Msg)
 init =
   let
     model = { challenges = Array.empty
-            , challengeId = 1
+            , challengeId = 0
             , input = Array.empty
             , state = Init
             , now = 0
-            , score = Nothing
+            , startTime = 0
+            , numErrors = 0
+            , numWords = 0
             , inputErrors = Array.empty
             , challengeErrors = Array.empty
-            , errorMatrix = Array.empty
+            , scoreMatrix = Array.empty
             }
-    cmd = Http.send Challenges (Http.getString challenge_url)
+    cmd = Cmd.batch
+          [ Random.generate Discard (Random.int Random.minInt Random.maxInt)
+          , Http.send Challenges (Http.getString challengeUrl) ]
   in
     (model, cmd)
 
+
+-- STYLES
+
+{-| Mono-space fonts -}
+monoFont : String
 monoFont = "Consolas,Monaco,Lucida Console,Liberation Mono,DejaVu Sans Mono,Bitstream Vera Sans Mono,Courier New,monospace"
 
+
+{-| Style for the input and challenge text -}
+textStyle : Attribute msg
 textStyle =
   style
     [ ("padding", "10px 10px")
     , ("font-family", monoFont)
+    , ("font-size", "100%")
     , ("white-space", "pre-wrap")
     , ("width", "84ch")
     , ("margin-left", "50%")
@@ -284,6 +355,9 @@ textStyle =
     , ("background-color", "#eff0f1")
     ]
 
+
+{-| Style for the countdown clock -}
+clockStyle : Attribute msg
 clockStyle =
   style
     [ ("padding", "10px 0px")
@@ -293,6 +367,8 @@ clockStyle =
     , ("text-align", "right")
     ]
 
+{-| Style for the Error and WPM display -}
+scoreStyle : Attribute msg
 scoreStyle =
   style
     [ ("padding", "10px 0px")
